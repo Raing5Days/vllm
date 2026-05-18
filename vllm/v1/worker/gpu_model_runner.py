@@ -3129,6 +3129,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with torch.cuda.stream(primary_stream):
             primary_stream.wait_stream(default_stream)
+            torch.cuda.nvtx.range_push("Forward-DualStream-Primary")
             with (set_forward_context(
                     attn_metadata[0],
                     self.vllm_config,
@@ -3141,7 +3142,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ubatch_slices=None,
                     timing_scheme_label=dual_model_inputs.
                     timing_scheme_label,
-            ), record_function_or_nullcontext("Forward-DualStream-Primary"),
+            ),
             self.maybe_get_kv_connector_output(scheduler_output) as
             kv_connector_output):
                 output_first = self.model(
@@ -3152,10 +3153,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=dual_model_inputs.first_inputs_embeds,
                     **model_kwargs,
                 )
+            torch.cuda.nvtx.range_pop()
             first_done.record(primary_stream)
 
         with torch.cuda.stream(secondary_stream):
             secondary_stream.wait_stream(default_stream)
+            torch.cuda.nvtx.range_push("Forward-DualStream-Secondary")
             with (set_forward_context(
                     attn_metadata[1],
                     self.vllm_config,
@@ -3168,7 +3171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ubatch_slices=None,
                     timing_scheme_label=dual_model_inputs.
                     timing_scheme_label,
-            ), record_function_or_nullcontext("Forward-DualStream-Secondary")):
+            )):
                 output_second = self.model(
                     input_ids=dual_model_inputs.second_input_ids,
                     positions=dual_model_inputs.second_positions,
@@ -3177,6 +3180,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=dual_model_inputs.second_inputs_embeds,
                     **model_kwargs,
                 )
+            torch.cuda.nvtx.range_pop()
             second_done.record(secondary_stream)
 
         default_stream.wait_event(first_done)
