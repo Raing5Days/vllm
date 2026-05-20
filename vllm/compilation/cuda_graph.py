@@ -40,6 +40,8 @@ class CUDAGraphEntry:
 
     # track attn_metadata tensor addresses for layer 0 and layer 1
     attn_metadata_addresses: Optional[dict[str, list[tuple[str, int]]]] = None
+    # 方案 A: 父图 exec（嵌入 PRIMARY + SECONDARY 子图，1× launch）
+    parent_exec: Optional[Any] = None
 
 
 @dataclasses.dataclass
@@ -47,6 +49,15 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+
+
+# 全局注册表：用于方案 A 构建父图
+_all_cudagraph_wrappers: list['CUDAGraphWrapper'] = []
+
+def build_all_parent_graphs():
+    """在所有已注册的 CUDAGraphWrapper 上构建父图。"""
+    for wrapper in _all_cudagraph_wrappers:
+        wrapper.build_parent_graphs()
 
 
 class CUDAGraphWrapper:
@@ -94,6 +105,11 @@ class CUDAGraphWrapper:
         # streams, it might not be safe to share a global pool.
         # only investigate this when we use multiple streams
         self.graph_pool = current_platform.get_global_graph_pool()
+        
+        # 注册到全局列表（方案 A: 父图构建）
+        if self.compilation_config.replay_mode in (
+                ReplayMode.DUAL_MIXED, ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_INPLACE):
+            _all_cudagraph_wrappers.append(self)
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -105,6 +121,10 @@ class CUDAGraphWrapper:
         
         self.graph_pool_secondary = current_platform.graph_pool_handle() if self.compilation_config.replay_mode == ReplayMode.DUAL_PARALLEL else None
         self.concrete_cudagraph_entries_secondary: dict[
+                BatchDescriptor, CUDAGraphEntry] = {}
+        
+        # 方案 A: 父图条目（合并 PRIMARY + SECONDARY 为一次 launch）
+        self.concrete_cudagraph_entries_parent: dict[
                 BatchDescriptor, CUDAGraphEntry] = {} 
 
 
@@ -202,7 +222,7 @@ class CUDAGraphWrapper:
                 
                 entry.attn_metadata_addresses = attn_meta_addrs
 
-            cudagraph = torch.cuda.CUDAGraph()
+            cudagraph = torch.cuda.CUDAGraph(keep_graph=True)
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -331,6 +351,24 @@ class CUDAGraphWrapper:
                         f"Captured: {entry.attn_metadata_addresses}, "
                         f"Current: {current_attn_addrs}")
         # print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
+        # 方案 A: 如果父图存在，PRIMARY 时 launch 父图（包含两个子图），SECONDARY 时跳过
+        parent_entry = self.concrete_cudagraph_entries_parent.get(batch_descriptor)
+        if parent_entry is not None and parent_entry.parent_exec is not None:
+            if stream_slot == StreamSlot.PRIMARY:
+                import ctypes
+                libcuda = ctypes.CDLL('libcuda.so.1')
+                stream_ptr = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
+                nvtx.range_push(f"ParentGraph Launch num_tokens: {batch_descriptor.num_tokens}")
+                libcuda.cuGraphLaunch(parent_entry.parent_exec, stream_ptr)
+                nvtx.range_pop()
+                # PRIMARY: 返回 PRIMARY 子图的 output
+                pri_entry = self.concrete_cudagraph_entries.get(batch_descriptor)
+                if pri_entry is not None:
+                    return pri_entry.output
+            else:
+                # SECONDARY: 父图已包含两个子图，返回 SECONDARY 子图的 output
+                return entry.output
+        
         if stream_slot == StreamSlot.PRIMARY:
             nvtx.range_push(f"CUDAGraph Replay Primary num_tokens: {batch_descriptor.num_tokens}")
             entry.cudagraph.replay()
@@ -339,4 +377,118 @@ class CUDAGraphWrapper:
             nvtx.range_push(f"CUDAGraph Replay Secondary num_tokens: {batch_descriptor.num_tokens}")
             entry.cudagraph.replay()
             nvtx.range_pop()
+        
+        # 运行时 lazy build: 两个子图都存在时构建父图
+        if stream_slot == StreamSlot.SECONDARY:
+            if entry.batch_descriptor.start_num_tokens is not None:
+                total_tokens = entry.batch_descriptor.start_num_tokens + entry.batch_descriptor.num_tokens
+                # 遍历所有 PRIMARY 条目，找 num_tokens 匹配的
+                found = None
+                for pri_bd, pri_entry in list(self.concrete_cudagraph_entries.items()):
+                    if pri_bd.num_tokens == entry.batch_descriptor.start_num_tokens:
+                        found = (pri_bd, pri_entry)
+                        break
+                if found is not None:
+                    pri_bd, pri_entry = found
+                    self._build_parent_graph(pri_bd, pri_entry, entry)
+                else:
+                    pass
+        
         return entry.output
+
+    def _build_parent_graph(self, bd, pri_entry, sec_entry):
+        import ctypes
+        libcuda = ctypes.CDLL('libcuda.so.1')
+        libcuda.cuInit(0)
+        CUresult = ctypes.c_int
+        
+        child_p = ctypes.c_void_p(pri_entry.cudagraph.raw_cuda_graph())
+        child_s = ctypes.c_void_p(sec_entry.cudagraph.raw_cuda_graph())
+        
+        parent_graph = ctypes.c_void_p()
+        libcuda.cuGraphCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        libcuda.cuGraphCreate.restype = CUresult
+        ret = libcuda.cuGraphCreate(ctypes.byref(parent_graph), 0)
+        if ret != 0:
+            return
+        
+        libcuda.cuGraphAddChildGraphNode.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_void_p]
+        libcuda.cuGraphAddChildGraphNode.restype = CUresult
+        
+        for child_handle in [child_p, child_s]:
+            node = ctypes.c_void_p()
+            ret = libcuda.cuGraphAddChildGraphNode(
+                ctypes.byref(node), parent_graph, None, 0, child_handle)
+            if ret != 0:
+                libcuda.cuGraphDestroy(parent_graph)
+                return
+        
+        parent_exec = ctypes.c_void_p()
+        libcuda.cuGraphInstantiate.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
+        libcuda.cuGraphInstantiate.restype = CUresult
+        ret = libcuda.cuGraphInstantiate(
+            ctypes.byref(parent_exec), parent_graph, None, None, 0)
+        if ret == 0:
+            parent_entry = CUDAGraphEntry(batch_descriptor=bd)
+            parent_entry.parent_exec = parent_exec
+            self.concrete_cudagraph_entries_parent[bd] = parent_entry
+        libcuda.cuGraphDestroy(parent_graph)
+
+    def build_parent_graphs(self):
+        """
+        Build parent CUDA graphs embedding PRIMARY + SECONDARY sub-graphs
+        to enable 1x launch instead of 2x launch.
+        """
+        import ctypes
+        libcuda = ctypes.CDLL('libcuda.so.1')
+        libcuda.cuInit(0)
+        CUresult = ctypes.c_int
+        
+        for bd, sec_entry in self.concrete_cudagraph_entries_secondary.items():
+            if bd not in self.concrete_cudagraph_entries:
+                continue
+            pri_entry = self.concrete_cudagraph_entries[bd]
+            
+            # Get sub-graph handles
+            child_p = ctypes.c_void_p(pri_entry.cudagraph.raw_cuda_graph())
+            child_s = ctypes.c_void_p(sec_entry.cudagraph.raw_cuda_graph())
+            
+            # Create parent graph
+            parent_graph = ctypes.c_void_p()
+            libcuda.cuGraphCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+            libcuda.cuGraphCreate.restype = CUresult
+            ret = libcuda.cuGraphCreate(ctypes.byref(parent_graph), 0)
+            if ret != 0:
+                continue
+            
+            # Add child graph nodes (no dependencies)
+            libcuda.cuGraphAddChildGraphNode.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_void_p]
+            libcuda.cuGraphAddChildGraphNode.restype = CUresult
+            
+            for child_handle in [child_p, child_s]:
+                node = ctypes.c_void_p()
+                ret = libcuda.cuGraphAddChildGraphNode(
+                    ctypes.byref(node), parent_graph, None, 0, child_handle)
+                if ret != 0:
+                    libcuda.cuGraphDestroy(parent_graph)
+                    break
+            else:
+                # Instantiate parent
+                parent_exec = ctypes.c_void_p()
+                libcuda.cuGraphInstantiate.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint]
+                libcuda.cuGraphInstantiate.restype = CUresult
+                ret = libcuda.cuGraphInstantiate(
+                    ctypes.byref(parent_exec), parent_graph, None, None, 0)
+                if ret == 0:
+                    parent_entry = CUDAGraphEntry(batch_descriptor=bd)
+                    parent_entry.parent_exec = parent_exec
+                    self.concrete_cudagraph_entries_parent[bd] = parent_entry
+                libcuda.cuGraphDestroy(parent_graph)

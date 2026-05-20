@@ -12,7 +12,7 @@ import torch.distributed
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ReplayMode, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
@@ -342,6 +342,11 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+            # 方案 A: capture 完成后构建父图（合并 PRIMARY + SECONDARY）
+            if self.vllm_config.compilation_config.replay_mode in (
+                    ReplayMode.DUAL_MIXED, ReplayMode.DUAL_PARALLEL, ReplayMode.DUAL_INPLACE):
+                from vllm.compilation.cuda_graph import build_all_parent_graphs
+                build_all_parent_graphs()
 
         if (self.cache_config.kv_cache_memory_bytes is None
                 and hasattr(self, "peak_activation_memory")):
