@@ -564,6 +564,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 StreamSlot.PRIMARY: torch.cuda.Stream(),
                 StreamSlot.SECONDARY: torch.cuda.Stream(),
             }
+            # 持久化 event 对象，避免 per-iteration create/destroy 开销
+            self.first_done = torch.cuda.Event()
+            self.second_done = torch.cuda.Event()
 
     def _nvml_get_used_memory(self) -> int:
         """Get the used GPU memory of the current process using NVML.
@@ -1350,7 +1353,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # This way, we can overlap the copy with the following CPU operations.
         # 这样，我们就能让复制操作与后续的CPU操作重叠进行。 commit_block_table 是从cpu复制到gpu
         # block_table 记录了每个请求中所需要的block id 列表 [num_reqs, max_num_blocks_per_req]
+        torch.cuda.nvtx.range_push("pi: commit_block_table")
         self.input_batch.block_table.commit_block_table(num_reqs)
+        torch.cuda.nvtx.range_pop()
 
         # self.micro_input_batch.block_table.commit_block_table(num_reqs)
 
@@ -1359,6 +1364,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         req_ids = self.input_batch.req_ids
         # 当前批次的请求ID列表
+        torch.cuda.nvtx.range_push("pi: build_token_arrays")
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         # 每个请求被调度的token数量列表 tokens[i] 表示第i个请求被调度的token数量 shaped: [num_reqs]
 
@@ -1380,8 +1386,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # cu_num_tokens 累计的token数量 每一个请求的结束位置 shaped: [num_reqs]
         cu_num_tokens, arange = self._get_cumsum_and_arange(
             num_scheduled_tokens)
+        torch.cuda.nvtx.range_pop()
 
         # Get positions.
+        torch.cuda.nvtx.range_push("pi: calc_positions_and_gather")
         positions_np = self.positions.np[:total_num_scheduled_tokens]
         # 每个token的position_ids shaped: [total_num_scheduled_tokens]
 
@@ -1426,6 +1434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 0,
                 token_indices_tensor,
                 out=self.is_token_ids.cpu[:total_num_scheduled_tokens])
+        torch.cuda.nvtx.range_pop()
 
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
@@ -1469,10 +1478,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # 计算 slot mapping 并提交
         # slot mapping [num_scheduled_tokens] 表示每个token在kv_cache中的位置索引
+        torch.cuda.nvtx.range_push("pi: slot_mapping")
         self.input_batch.block_table.compute_slot_mapping(
             req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
+        torch.cuda.nvtx.range_pop()
 
         # example:
         # num_reqs = 3          请求数量
@@ -1495,8 +1506,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
         # 填充query_start_loc的剩余部分 非递减 
         # 例如 num_reqs=3 则 query_start_loc.shape=[0,2,7,10,10,10,10,...],[max_num_reqs + 1]
+        torch.cuda.nvtx.range_push("pi: query_start_loc")
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
+        torch.cuda.nvtx.range_pop()
 
 
 
@@ -1513,6 +1526,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # 构建 ubatch_slices 
         # DBO 模式是对半切分 dual 模式是自己定义切分点
+        torch.cuda.nvtx.range_push("pi: split_decision")
         if self._should_split_for_cudagraph(
             total_num_scheduled_tokens,uniform_decode,vllm_config=self.vllm_config):
             # Dual 模式下 构建cudagraph拆分 所需要的ubatch_slices
@@ -1531,13 +1545,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_tokens_padded,
                             uniform_decode=uniform_decode,
                             vllm_config=self.vllm_config)
+        torch.cuda.nvtx.range_pop()
         
         # ubatch_slices 包括请求切片和token切片信息
 
         # seq_lens
         # computed_tokens + scheduled_tokens = 当前批次每个请求的总token数量 也就是seq_lens序列长度 已经计算过的token数量 + 本次调度的token数量
         # E.g., [10,30,40] + [2,5,3] = [12,35,43]
-
+        
+        torch.cuda.nvtx.range_push("pi: seq_lens_and_discard")
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
@@ -1565,10 +1581,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.discard_request_indices.np[:self.num_discarded_requests] = (
             discard_request_indices)
 
-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        self.discard_request_indices.np[self.num_discarded_requests:].fill(0)
+        torch.cuda.nvtx.range_pop()
 
         # Copy the tensors to the GPU.
         # 将张量复制到GPU。
+        torch.cuda.nvtx.range_push("pi: copy_to_gpu")
+        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
         if self.uses_mrope:
@@ -1579,6 +1598,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
+        torch.cuda.nvtx.range_pop()
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -1616,6 +1636,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
+        torch.cuda.nvtx.range_push("pi: logits_and_attn_prep")
         logits_indices_padded = None
         if self.cache_config.kv_sharing_fast_prefill:
             logits_indices_padded = self._prepare_kv_sharing_fast_prefill(
@@ -1636,7 +1657,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs])
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("pi: kv_cache_loop")
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -1739,60 +1762,76 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # 使用 single buffer 模式 直接拆分 common_attn_metadata
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
-                    for ubid, common_attn_metadata in enumerate(
-                            common_attn_metadata_list):
-                        attn_metadata_i = (attn_group.get_metadata_builder(
-                            ubatch_id=ubid).build(
-                                common_prefix_len=common_prefix_len,
-                                common_attn_metadata=common_attn_metadata))
 
+                    # ubid=0 (PRIMARY): 用 build() 构建，含 scheduler_metadata 计算 + 地址修正
+                    attn_metadata_i = (attn_group.get_metadata_builder(
+                        ubatch_id=0).build(
+                            common_prefix_len=common_prefix_len,
+                            common_attn_metadata=common_attn_metadata_list[0]))
 
-                        if ubid == 0 and split_for_cudagraph:
-                            # 解决primary 中query_start_loc地址不匹配的问题（似乎没影响，3.29）
-                            sub_num_reqs = common_attn_metadata.num_reqs
-                            sub_num_tokens = common_attn_metadata.num_actual_tokens
+                    if split_for_cudagraph:
+                        sub_num_reqs = common_attn_metadata_list[0].num_reqs
+                        sub_num_tokens = common_attn_metadata_list[0].num_actual_tokens
 
-                            # split_attn_metadata 中 slice_query_start_locs
-                            # 通过减法创建了新张量，地址不再是持久缓冲区
-                            # 需要写回 self.query_start_loc.gpu 以匹配捕获时的地址
-                            self.query_start_loc.gpu[
-                                :sub_num_reqs + 1].copy_(
-                                    attn_metadata_i.query_start_loc)
-                            self.query_start_loc.gpu[
-                                sub_num_reqs + 1:].fill_(sub_num_tokens)
-                            primary_qsl = self.query_start_loc.gpu[
-                                :sub_num_reqs + 1]
-                            # seq_lens / block_table / slot_mapping 在第一个
-                            # ubatch 中是从下标 0 开始的 view，地址天然匹配。
-                            # 仅当请求被拆分时 seq_lens 会 clone，此时也需写回。
-                            if attn_metadata_i.seq_lens.data_ptr() != \
-                                    self.seq_lens.gpu.data_ptr():
-                                self.seq_lens.gpu[
-                                    :sub_num_reqs].copy_(
-                                        attn_metadata_i.seq_lens)
-                                self.seq_lens.gpu[sub_num_reqs:].fill_(0)
+                        self.query_start_loc.gpu[
+                            :sub_num_reqs + 1].copy_(
+                                attn_metadata_i.query_start_loc)
+                        self.query_start_loc.gpu[
+                            sub_num_reqs + 1:].fill_(sub_num_tokens)
+                        primary_qsl = self.query_start_loc.gpu[
+                            :sub_num_reqs + 1]
+                        if attn_metadata_i.seq_lens.data_ptr() != \
+                                self.seq_lens.gpu.data_ptr():
+                            self.seq_lens.gpu[
+                                :sub_num_reqs].copy_(
+                                    attn_metadata_i.seq_lens)
+                            self.seq_lens.gpu[sub_num_reqs:].fill_(0)
 
-                            attn_metadata_i = FlashAttentionMetadata(
-                                num_actual_tokens=attn_metadata_i.num_actual_tokens,
-                                max_query_len=attn_metadata_i.max_query_len,
-                                query_start_loc=primary_qsl,
-                                max_seq_len=attn_metadata_i.max_seq_len,
-                                seq_lens=self.seq_lens.gpu[:sub_num_reqs],
-                                block_table=attn_metadata_i.block_table,
-                                slot_mapping=attn_metadata_i.slot_mapping,
-                                use_cascade=attn_metadata_i.use_cascade,
-                                common_prefix_len=common_prefix_len,
-                                scheduler_metadata=attn_metadata_i.scheduler_metadata,
-                                cu_prefix_query_lens=attn_metadata_i.cu_prefix_query_lens,
-                                prefix_kv_lens=attn_metadata_i.prefix_kv_lens,
-                                suffix_kv_lens=attn_metadata_i.suffix_kv_lens,
-                                prefix_scheduler_metadata=attn_metadata_i.prefix_scheduler_metadata,
-                                max_num_splits=attn_metadata_i.max_num_splits,
-                                causal=attn_metadata_i.causal)
-                        
-                        for layer_name in kv_cache_group_spec.layer_names:
-                            assert type(attn_metadata) is list
-                            attn_metadata[ubid][layer_name] = attn_metadata_i
+                        attn_metadata_i = FlashAttentionMetadata(
+                            num_actual_tokens=attn_metadata_i.num_actual_tokens,
+                            max_query_len=attn_metadata_i.max_query_len,
+                            query_start_loc=primary_qsl,
+                            max_seq_len=attn_metadata_i.max_seq_len,
+                            seq_lens=self.seq_lens.gpu[:sub_num_reqs],
+                            block_table=attn_metadata_i.block_table,
+                            slot_mapping=attn_metadata_i.slot_mapping,
+                            use_cascade=attn_metadata_i.use_cascade,
+                            common_prefix_len=common_prefix_len,
+                            scheduler_metadata=attn_metadata_i.scheduler_metadata,
+                            cu_prefix_query_lens=attn_metadata_i.cu_prefix_query_lens,
+                            prefix_kv_lens=attn_metadata_i.prefix_kv_lens,
+                            suffix_kv_lens=attn_metadata_i.suffix_kv_lens,
+                            prefix_scheduler_metadata=attn_metadata_i.prefix_scheduler_metadata,
+                            max_num_splits=attn_metadata_i.max_num_splits,
+                            causal=attn_metadata_i.causal)
+
+                    for layer_name in kv_cache_group_spec.layer_names:
+                        assert type(attn_metadata) is list
+                        attn_metadata[0][layer_name] = attn_metadata_i
+
+                    # ubid=1 (SECONDARY): 直接构造 FlashAttentionMetadata，跳过 build()
+                    sub_m = common_attn_metadata_list[1]
+                    attn_metadata_second = FlashAttentionMetadata(
+                        num_actual_tokens=sub_m.num_actual_tokens,
+                        max_query_len=sub_m.max_query_len,
+                        query_start_loc=sub_m.query_start_loc,
+                        max_seq_len=sub_m.max_seq_len,
+                        seq_lens=sub_m.seq_lens,
+                        block_table=sub_m.block_table_tensor,
+                        slot_mapping=sub_m.slot_mapping,
+                        use_cascade=False,
+                        common_prefix_len=common_prefix_len,
+                        scheduler_metadata=None,
+                        cu_prefix_query_lens=None,
+                        prefix_kv_lens=None,
+                        suffix_kv_lens=None,
+                        prefix_scheduler_metadata=None,
+                        max_num_splits=0,
+                        causal=True)
+
+                    for layer_name in kv_cache_group_spec.layer_names:
+                        assert type(attn_metadata) is list
+                        attn_metadata[1][layer_name] = attn_metadata_second
                 elif ubatch_slices is not None:
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
@@ -1930,6 +1969,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         **extra_attn_metadata_args)
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
+
+        torch.cuda.nvtx.range_pop()
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -3119,8 +3160,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         primary_stream = self.graph_streams[StreamSlot.PRIMARY]
         secondary_stream = self.graph_streams[StreamSlot.SECONDARY]
 
-        first_done = torch.cuda.Event()
-        second_done = torch.cuda.Event()
         kv_connector_output = None
         default_stream = torch.cuda.current_stream()
 
@@ -3154,7 +3193,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     **model_kwargs,
                 )
             torch.cuda.nvtx.range_pop()
-            first_done.record(primary_stream)
+            self.first_done.record(primary_stream)
 
         with torch.cuda.stream(secondary_stream):
             secondary_stream.wait_stream(default_stream)
@@ -3181,10 +3220,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     **model_kwargs,
                 )
             torch.cuda.nvtx.range_pop()
-            second_done.record(secondary_stream)
 
-        default_stream.wait_event(first_done)
-        default_stream.wait_event(second_done)
+        self.second_done.record(secondary_stream)
+
+        default_stream.wait_event(self.first_done)
+        default_stream.wait_event(self.second_done)
         if timing_events is not None:
             timing_events[1].record(default_stream)
         merged_output = torch.cat([output_first, output_second], dim=0)
@@ -3233,12 +3273,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         "it when the requests need prompt logprobs")
 
                 # Prepare the decoder inputs.
+                torch.cuda.nvtx.range_push("_prepare_inputs")
                 (attn_metadata, logits_indices, spec_decode_metadata,
                  num_scheduled_tokens_np, spec_decode_common_attn_metadata,
                  max_query_len, ubatch_slices, num_tokens_after_padding,
                  split_for_cudagraph
                  ) = self._prepare_inputs(scheduler_output)
+                torch.cuda.nvtx.range_pop()
 
+            torch.cuda.nvtx.range_push("_preprocess")
             (
                 num_scheduled_tokens,
                 num_input_tokens,
@@ -3250,7 +3293,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model_kwargs,
             ) = self._preprocess(scheduler_output, intermediate_tensors,
                                  ubatch_slices, num_tokens_after_padding,split_for_cudagraph)
+            torch.cuda.nvtx.range_pop()
             # cudagraph related 在执行过程中准备
+            torch.cuda.nvtx.range_push("cudagraph_dispatch")
             uniform_decode = (max_query_len
                               == self.uniform_decode_query_len) and (
                                   num_scheduled_tokens
@@ -3269,6 +3314,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     intermediate_tensors=intermediate_tensors,
                     uniform_decode=uniform_decode,
                 )
+            torch.cuda.nvtx.range_pop()
 
         # ========== 新增：Preprocess 后的显存统计 ==========
         if torch.cuda.is_available() and show_mem_info:
@@ -3440,6 +3486,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # print(f"  Peak Reserved:  {peak_reserved:.2f} MB")
             print(f"{'='*80}\n")
 
+        torch.cuda.nvtx.range_push("postprocess_logits")
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -3499,9 +3546,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if scheduler_output.grammar_bitmask is not None:
                 apply_grammar_bitmask(scheduler_output, self.input_batch,
                                       logits, self.device)
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("_sample")
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        torch.cuda.nvtx.range_pop()
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -3538,6 +3588,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # as inputs, and does not need to wait for bookkeeping to finish.
             propose_draft_token_ids(sampler_output.sampled_token_ids)
 
+        torch.cuda.nvtx.range_push("_bookkeeping_sync")
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
@@ -3550,6 +3601,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             ) = self._bookkeeping_sync(scheduler_output, sampler_output,
                                        logits, hidden_states,
                                        num_scheduled_tokens)
+        torch.cuda.nvtx.range_pop()
 
         if (self.speculative_config and not use_padded_batch_for_eagle
                 and input_fits_in_drafter):
