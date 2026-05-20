@@ -113,6 +113,11 @@ def slice_query_start_locs(
     Note: This function creates a new tensor to hold the new query_start_locs.
     This will break cudagraph compatibility.
     """
+    # DUAL_INPLACE: PRIMARY split always has start=0.
+    # When start=0, subtracting query_start_loc[0] (= 0) is a no-op
+    # that still launches an unnecessary GPU kernel. Skip it.
+    if request_slice.start == 0:
+        return query_start_loc[:request_slice.stop + 1]
     return query_start_loc[request_slice.start: request_slice.stop + 1] -\
         query_start_loc[request_slice.start]
 
