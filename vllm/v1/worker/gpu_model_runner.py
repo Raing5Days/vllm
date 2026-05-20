@@ -3163,6 +3163,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_connector_output = None
         default_stream = torch.cuda.current_stream()
 
+        # 方案 3: 使用组合图（已 capture 则直接 replay）
+        first_bd = dual_model_inputs.first_batch_descriptor
+        total = first_bd.num_tokens + dual_model_inputs.second_batch_descriptor.num_tokens
+        combo_key = (first_bd.num_tokens, total)
+        combo_entries: dict = getattr(self, "_combo_graph_entries", {})
+        if combo_key in combo_entries:
+            combo_g, output_first, output_second = combo_entries[combo_key]
+            nvtx.range_push(f"ComboGraph replay key={combo_key}")
+            combo_g.replay()
+            nvtx.range_pop()
+            if timing_events is not None:
+                timing_events[0].record(default_stream)
+                timing_events[1].record(default_stream)
+            merged_output = torch.cat([output_first, output_second], dim=0)
+            return merged_output, kv_connector_output
+
         if timing_events is not None:
             timing_events[0].record(default_stream)
 
@@ -3227,6 +3243,48 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         default_stream.wait_event(self.second_done)
         if timing_events is not None:
             timing_events[1].record(default_stream)
+        
+        # 方案 3: 懒式 capture 组合图（仅首轮执行，后续 iteration 直接 replay）
+        combo_entries: dict = getattr(self, "_combo_graph_entries", {})
+        if combo_key not in combo_entries:
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+            import warnings
+            CUDAGraphWrapper._skip_graph_capture = True
+            try:
+                combo_g = torch.cuda.CUDAGraph()
+                pool = torch.cuda.graph_pool_handle()
+                with torch.cuda.graph(combo_g, pool=pool):
+                    with set_forward_context(attn_metadata[0], self.vllm_config,
+                            num_tokens=dual_model_inputs.first_num_tokens,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=dual_model_inputs.first_cudagraph_runtime_mode,
+                            batch_descriptor=dual_model_inputs.first_batch_descriptor,
+                            stream_slot=StreamSlot.PRIMARY):
+                        out_a = self.model(
+                            input_ids=dual_model_inputs.first_input_ids,
+                            positions=dual_model_inputs.first_positions,
+                            intermediate_tensors=dual_model_inputs.first_intermediate_tensors,
+                            inputs_embeds=dual_model_inputs.first_inputs_embeds, **model_kwargs)
+                    with set_forward_context(attn_metadata[1], self.vllm_config,
+                            num_tokens=dual_model_inputs.second_num_tokens,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=dual_model_inputs.second_cudagraph_runtime_mode,
+                            batch_descriptor=dual_model_inputs.second_batch_descriptor,
+                            stream_slot=StreamSlot.SECONDARY):
+                        out_b = self.model(
+                            input_ids=dual_model_inputs.second_input_ids,
+                            positions=dual_model_inputs.second_positions,
+                            intermediate_tensors=dual_model_inputs.second_intermediate_tensors,
+                            inputs_embeds=dual_model_inputs.second_inputs_embeds, **model_kwargs)
+                torch.cuda.synchronize()
+                if not hasattr(self, '_combo_graph_entries'):
+                    self._combo_graph_entries = {}
+                self._combo_graph_entries[combo_key] = (combo_g, out_a, out_b)
+            except Exception as e:
+                warnings.warn(f"[ComboGraph] Capture failed: {e}")
+            finally:
+                CUDAGraphWrapper._skip_graph_capture = False
+        
         merged_output = torch.cat([output_first, output_second], dim=0)
         return merged_output, kv_connector_output
 
@@ -4772,6 +4830,40 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
         return cuda_graph_size
+
+    def _capture_combined_graphs(self, num_tokens_list: list[int],
+                                 uniform_decode: bool):
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        if not hasattr(self, '_combo_graph_entries'):
+            self._combo_graph_entries: dict = {}
+        for num_tokens in num_tokens_list:
+            if not self._should_split_for_cudagraph(
+                    num_tokens, uniform_decode, vllm_config=self.vllm_config):
+                continue
+            split_point = self._get_split_point(num_tokens)
+            if split_point is None:
+                continue
+            CUDAGraphWrapper._skip_graph_capture = True
+            combo_g = torch.cuda.CUDAGraph()
+            pool = torch.cuda.graph_pool_handle()
+            outputs = []
+            with torch.cuda.graph(combo_g, pool=pool):
+                out_p = self._dummy_run(
+                    split_point, stream_slot=StreamSlot.PRIMARY,
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    uniform_decode=uniform_decode,
+                    skip_eplb=True, remove_lora=False)
+                outputs.append(out_p)
+                out_s = self._dummy_run(
+                    num_tokens - split_point, stream_slot=StreamSlot.SECONDARY,
+                    cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                    uniform_decode=uniform_decode,
+                    skip_eplb=True, remove_lora=False)
+                outputs.append(out_s)
+            CUDAGraphWrapper._skip_graph_capture = False
+            torch.cuda.synchronize()
+            combo_key = (split_point, num_tokens)
+            self._combo_graph_entries[combo_key] = (combo_g, outputs[0], outputs[1])
 
     # capture cudagraphs 的调用处
     def _capture_cudagraphs(self, compilation_cases: list[int],
