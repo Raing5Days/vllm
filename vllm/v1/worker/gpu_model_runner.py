@@ -1759,17 +1759,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # TODO 方案二，基于micro_common_attn_metadata 来构建 attn_metadata[1] 但是要ubatch[1]切片信息正确
 
                 if ubatch_slices is not None and self.compilation_config.replay_mode == ReplayMode.DUAL_INPLACE:
+                    torch.cuda.nvtx.range_push("pi:dual:split")
                     # 使用 single buffer 模式 直接拆分 common_attn_metadata
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
+                    torch.cuda.nvtx.range_pop()
 
+                    torch.cuda.nvtx.range_push("pi:dual:primary_build")
                     # ubid=0 (PRIMARY): 用 build() 构建，含 scheduler_metadata 计算 + 地址修正
                     attn_metadata_i = (attn_group.get_metadata_builder(
                         ubatch_id=0).build(
                             common_prefix_len=common_prefix_len,
                             common_attn_metadata=common_attn_metadata_list[0]))
+                    torch.cuda.nvtx.range_pop()
 
                     if split_for_cudagraph:
+                        torch.cuda.nvtx.range_push("pi:dual:primary_addr_fixup")
                         sub_num_reqs = common_attn_metadata_list[0].num_reqs
                         sub_num_tokens = common_attn_metadata_list[0].num_actual_tokens
 
@@ -1804,11 +1809,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             prefix_scheduler_metadata=attn_metadata_i.prefix_scheduler_metadata,
                             max_num_splits=attn_metadata_i.max_num_splits,
                             causal=attn_metadata_i.causal)
+                        torch.cuda.nvtx.range_pop()
 
                     for layer_name in kv_cache_group_spec.layer_names:
                         assert type(attn_metadata) is list
                         attn_metadata[0][layer_name] = attn_metadata_i
 
+                    torch.cuda.nvtx.range_push("pi:dual:secondary_construct")
                     # ubid=1 (SECONDARY): 直接构造 FlashAttentionMetadata，跳过 build()
                     sub_m = common_attn_metadata_list[1]
                     attn_metadata_second = FlashAttentionMetadata(
@@ -1828,6 +1835,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         prefix_scheduler_metadata=None,
                         max_num_splits=0,
                         causal=True)
+                    torch.cuda.nvtx.range_pop()
 
                     for layer_name in kv_cache_group_spec.layer_names:
                         assert type(attn_metadata) is list
