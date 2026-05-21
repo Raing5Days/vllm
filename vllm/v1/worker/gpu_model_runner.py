@@ -567,6 +567,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # 持久化 event 对象，避免 per-iteration create/destroy 开销
             self.first_done = torch.cuda.Event()
             self.second_done = torch.cuda.Event()
+            # 预分配 merged output buffer，避免 per-iteration torch.cat 分配
+            self._merged_output = None
+    def _merge_model_outputs(self, first, second):
+        """Concatenate two model outputs in pre-allocated buffer, avoiding torch.cat allocation."""
+        n_first, n_second = first.shape[0], second.shape[0]
+        total = n_first + n_second
+        if self._merged_output is None or self._merged_output.shape[0] != total:
+            self._merged_output = torch.empty(
+                (total, *first.shape[1:]), dtype=first.dtype, device=first.device)
+        self._merged_output[:n_first].copy_(first)
+        self._merged_output[n_first:].copy_(second)
+        return self._merged_output
+
 
     def _nvml_get_used_memory(self) -> int:
         """Get the used GPU memory of the current process using NVML.
@@ -3188,7 +3201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if timing_events is not None:
                 timing_events[0].record(default_stream)
                 timing_events[1].record(default_stream)
-            merged_output = torch.cat([output_first, output_second], dim=0)
+            merged_output = self._merge_model_outputs(output_first, output_second)
             return merged_output, kv_connector_output
 
         # ========== 首轮：懒式 capture 组合图（仅一次 model forward）==========
@@ -3270,7 +3283,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             CUDAGraphWrapper._skip_graph_capture = False
             if timing_events is not None:
                 timing_events[1].record(default_stream)
-            merged_output = torch.cat([out_a, out_b], dim=0)
+            merged_output = self._merge_model_outputs(out_a, out_b)
             return merged_output, kv_connector_output
 
         except Exception as e:
@@ -3344,7 +3357,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if timing_events is not None:
             timing_events[1].record(default_stream)
         
-        merged_output = torch.cat([output_first, output_second], dim=0)
+        merged_output = self._merge_model_outputs(output_first, output_second)
         return merged_output, kv_connector_output
 
     @torch.inference_mode()
