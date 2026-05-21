@@ -202,6 +202,35 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+def _slice_sub_meta(cm, rs, ts):
+    """Construct sub CommonAttentionMetadata from views of original (clean split only)."""
+    n_reqs = rs.stop - rs.start
+    n_toks = ts.stop - ts.start
+    qsl_gpu = cm.query_start_loc[rs.start:rs.stop + 1].clone()
+    qsl_cpu = cm.query_start_loc_cpu[rs.start:rs.stop + 1].clone()
+    offset = qsl_cpu[0].item()
+    if offset != 0:
+        qsl_gpu -= offset
+        qsl_cpu -= offset
+    sl_cpu = cm.seq_lens_cpu[rs]
+    max_sl = int(sl_cpu.max().item())
+    max_ql = int(torch.max(torch.abs(qsl_cpu[1:] - qsl_cpu[:-1])).item())
+    if max_ql == 0:
+        max_ql = cm.max_query_len
+    return CommonAttentionMetadata(
+        query_start_loc=qsl_gpu,
+        query_start_loc_cpu=qsl_cpu,
+        seq_lens=cm.seq_lens[rs],
+        seq_lens_cpu=sl_cpu,
+        num_computed_tokens_cpu=cm.num_computed_tokens_cpu[rs],
+        num_reqs=n_reqs,
+        num_actual_tokens=n_toks,
+        max_query_len=max_ql,
+        max_seq_len=max_sl,
+        block_table_tensor=cm.block_table_tensor[rs],
+        slot_mapping=cm.slot_mapping[ts],
+    )
+
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def __init__(
@@ -1774,9 +1803,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # TODO 方案二，基于micro_common_attn_metadata 来构建 attn_metadata[1] 但是要ubatch[1]切片信息正确
 
                 if ubatch_slices is not None and self.compilation_config.replay_mode == ReplayMode.DUAL_INPLACE:
-                    # 使用 single buffer 模式 直接拆分 common_attn_metadata
-                    common_attn_metadata_list = split_attn_metadata(
-                        ubatch_slices, common_attn_metadata)
+                    # 跳过 split_attn_metadata（有 GPU slice 运算），直接构造子 metadata
+                    sub_m = _slice_sub_meta(
+                        common_attn_metadata,
+                        ubatch_slices[0].request_slice,
+                        ubatch_slices[0].token_slice)
+                    sub_m2 = _slice_sub_meta(
+                        common_attn_metadata,
+                        ubatch_slices[1].request_slice,
+                        ubatch_slices[1].token_slice)
+                    common_attn_metadata_list = [sub_m, sub_m2]
 
                     # ubid=0 (PRIMARY): 用 build() 构建（可缓存 scheduler_metadata）
                     sub_m = common_attn_metadata_list[0]
