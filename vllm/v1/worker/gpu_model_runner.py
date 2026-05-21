@@ -569,6 +569,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.second_done = torch.cuda.Event()
             # 预分配 merged output buffer，避免 per-iteration torch.cat 分配
             self._merged_output = None
+            # scheduler_metadata 缓存：对相同 split 复用 build() 的 CUDA kernel 结果
+            self._scheduler_metadata_cache = {}
     def _merge_model_outputs(self, first, second):
         """Concatenate two model outputs in pre-allocated buffer, avoiding torch.cat allocation."""
         n_first, n_second = first.shape[0], second.shape[0]
@@ -1776,15 +1778,43 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     common_attn_metadata_list = split_attn_metadata(
                         ubatch_slices, common_attn_metadata)
 
-                    # ubid=0 (PRIMARY): 用 build() 构建，含 scheduler_metadata 计算 + 地址修正
-                    attn_metadata_i = (attn_group.get_metadata_builder(
-                        ubatch_id=0).build(
+                    # ubid=0 (PRIMARY): 用 build() 构建（可缓存 scheduler_metadata）
+                    sub_m = common_attn_metadata_list[0]
+                    cache_key = (sub_m.num_reqs, sub_m.num_actual_tokens)
+                    if cache_key in self._scheduler_metadata_cache:
+                        # Cache hit: 跳过 build()，使用缓存的 scheduler_metadata
+                        scheduler_metadata, prefix_scheduler_metadata = \
+                            self._scheduler_metadata_cache[cache_key]
+                        attn_metadata_i = FlashAttentionMetadata(
+                            num_actual_tokens=sub_m.num_actual_tokens,
+                            max_query_len=sub_m.max_query_len,
+                            query_start_loc=sub_m.query_start_loc,
+                            max_seq_len=sub_m.max_seq_len,
+                            seq_lens=sub_m.seq_lens,
+                            block_table=sub_m.block_table_tensor,
+                            slot_mapping=sub_m.slot_mapping,
+                            use_cascade=False,
                             common_prefix_len=common_prefix_len,
-                            common_attn_metadata=common_attn_metadata_list[0]))
-
+                            scheduler_metadata=scheduler_metadata,
+                            cu_prefix_query_lens=None,
+                            prefix_kv_lens=None,
+                            suffix_kv_lens=None,
+                            prefix_scheduler_metadata=prefix_scheduler_metadata,
+                            max_num_splits=0,
+                            causal=True)
+                    else:
+                        # Cache miss: 调用 build()，保存 scheduler_metadata
+                        attn_metadata_i = (attn_group.get_metadata_builder(
+                            ubatch_id=0).build(
+                                common_prefix_len=common_prefix_len,
+                                common_attn_metadata=sub_m))
+                        # 保存 scheduler_metadata（clone 避免后续被改写）
+                        self._scheduler_metadata_cache[cache_key] = (
+                            attn_metadata_i.scheduler_metadata.clone(),
+                            attn_metadata_i.prefix_scheduler_metadata)
                     if split_for_cudagraph:
-                        sub_num_reqs = common_attn_metadata_list[0].num_reqs
-                        sub_num_tokens = common_attn_metadata_list[0].num_actual_tokens
+                        sub_num_reqs = sub_m.num_reqs
+                        sub_num_tokens = sub_m.num_actual_tokens
 
                         self.query_start_loc.gpu[
                             :sub_num_reqs + 1].copy_(
