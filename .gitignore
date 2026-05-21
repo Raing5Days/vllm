@@ -229,3 +229,12 @@ mode_benchmark*/
 split_mode*/
 tests_script/tmp_test/
 
+# Build artifacts from in-tree cmake builds
+CPackConfig.cmake
+CPackSourceConfig.cmake
+cmake_install.cmake
+_deps/
+ctest/
+detect_cuda_*.cu
+detect_cuda_*.cc
+detect_unroll_*.S
