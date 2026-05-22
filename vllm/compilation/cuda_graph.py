@@ -340,9 +340,9 @@ class CUDAGraphWrapper:
                 # else:
                 #     layer1_addrs.append((key, id(tensor)))
             current_attn_addrs[f'layer_{second_layer}'] = layer1_addrs
-            
-            # 比较地址
-            if current_attn_addrs != entry.attn_metadata_addresses:
+
+            # 比较地址（仅 debug 模式打印）
+            if self.is_debugging_mode and current_attn_addrs != entry.attn_metadata_addresses:
                 print("CUDA GRAPH ATTENTION METADATA ADDRESS MISMATCH DETECTED!")
                 print(f"=== ATTN_METADATA ADDRESS MISMATCH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
                 for layer_key in current_attn_addrs.keys():
@@ -351,12 +351,10 @@ class CUDAGraphWrapper:
                     for attr_name in captured.keys():
                         if captured[attr_name] != current.get(attr_name):
                             print(f"  [{layer_key}] {attr_name}: captured={captured[attr_name]}, current={current.get(attr_name)}")
-                
-                if self.is_debugging_mode:
-                    assert False, (
-                        f"Attn_metadata addresses are different during replay. "
-                        f"Captured: {entry.attn_metadata_addresses}, "
-                        f"Current: {current_attn_addrs}")
+                assert False, (
+                    f"Attn_metadata addresses are different during replay. "
+                    f"Captured: {entry.attn_metadata_addresses}, "
+                    f"Current: {current_attn_addrs}")
         # print(f"=== REPLAY CUDAGRAPH | slot={stream_slot.name} | num_tokens={batch_descriptor.num_tokens} ===")
         # 方案 A: 如果父图存在，PRIMARY 时 launch 父图（包含两个子图），SECONDARY 时跳过
         parent_entry = self.concrete_cudagraph_entries_parent.get(batch_descriptor)
