@@ -1631,7 +1631,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Copy the tensors to the GPU.
         # 将张量复制到GPU。
         torch.cuda.nvtx.range_push("pi: copy_to_gpu")
-        self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        # discard_request_indices GPU copy 仅用于 spec decode 路径
+        if scheduler_output.scheduled_spec_decode_tokens:
+            self.discard_request_indices.copy_to_gpu(
+                self.num_discarded_requests)
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
         if self.uses_mrope:
